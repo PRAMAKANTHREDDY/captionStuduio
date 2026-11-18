@@ -16,12 +16,17 @@ server-generated folder names.
 """
 
 import datetime as dt
+import base64
+import binascii
+import hmac
 import json
 import os
 import sys
 import re
 import secrets
+import shutil
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -30,9 +35,10 @@ import caption_effects as fx
 import transcribe as tr
 
 WINDOWS = sys.platform == "win32"
-HOST, PORT = "127.0.0.1", int(os.environ.get("CAPTION_STUDIO_PORT", "8765"))
+HOST = os.environ.get("CAPTION_STUDIO_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", os.environ.get("CAPTION_STUDIO_PORT", "8765")))
 ROOT = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(ROOT, "recordings", "uploads")
+UPLOAD_DIR = os.environ.get("CAPTION_STUDIO_UPLOAD_DIR", os.path.join(ROOT, "recordings", "uploads"))
 LANGUAGES = {  # Whisper language codes offered in the page
     "en": "English", "hi": "Hindi", "te": "Telugu", "ta": "Tamil", "bn": "Bengali", "mr": "Marathi",
     "ur": "Urdu", "es": "Spanish", "fr": "French", "de": "German", "it": "Italian", "pt": "Portuguese",
@@ -41,15 +47,31 @@ LANGUAGES = {  # Whisper language codes offered in the page
     "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
 }
 ALLOWED_EXT = {".mov", ".mp4", ".m4v"}
-MAX_UPLOAD = 4 * 1024 ** 3  # 4 GB
+_LOCAL_BIND = HOST in ("127.0.0.1", "::1", "localhost")
+_AUTH_USERNAME = os.environ.get("CAPTION_STUDIO_USERNAME", "")
+_AUTH_PASSWORD = os.environ.get("CAPTION_STUDIO_PASSWORD", "")
+_configured_hosts = os.environ.get("CAPTION_STUDIO_ALLOWED_HOSTS", "")
+ALLOWED_HOSTS = ({f"127.0.0.1:{PORT}", f"localhost:{PORT}"} if _LOCAL_BIND else
+         {host.strip().lower() for host in _configured_hosts.split(",") if host.strip()})
+if not _LOCAL_BIND and (not _AUTH_USERNAME or not _AUTH_PASSWORD or not ALLOWED_HOSTS):
+  raise RuntimeError("Public binding requires CAPTION_STUDIO_USERNAME, CAPTION_STUDIO_PASSWORD, "
+             "and CAPTION_STUDIO_ALLOWED_HOSTS")
+MAX_UPLOAD = int(os.environ.get(
+  "CAPTION_STUDIO_MAX_UPLOAD_BYTES", str(4 * 1024 ** 3 if _LOCAL_BIND else 100 * 1024 ** 2)))
+if MAX_UPLOAD <= 0:
+    raise RuntimeError("CAPTION_STUDIO_MAX_UPLOAD_BYTES must be positive")
+RETENTION_HOURS = float(os.environ.get("CAPTION_STUDIO_RETENTION_HOURS", "0" if _LOCAL_BIND else "24"))
+if RETENTION_HOURS < 0:
+    raise RuntimeError("CAPTION_STUDIO_RETENTION_HOURS cannot be negative")
 ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[0-9a-f]{8}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 
 jobs = {}  # job id -> {"state": queued|running|done|error, "log": [...], ...}
 jobs_lock = threading.Lock()
 work_lock = threading.Lock()
 kw_lock = threading.Lock()  # one transcription/export at a time (CPU heavy)
+active_sessions = set()
+active_sessions_lock = threading.Lock()
 
 
 def session_path(sid):
@@ -67,26 +89,56 @@ def session_video(sess):
     return None
 
 
-def run_job(job_id, fn):
+def cleanup_expired_sessions():
+    if RETENTION_HOURS <= 0:
+        return
+    cutoff = time.time() - RETENTION_HOURS * 3600
+    with active_sessions_lock:
+        active = set(active_sessions)
+    for name in os.listdir(UPLOAD_DIR):
+        if not ID_RE.fullmatch(name):
+            continue
+        path = os.path.join(UPLOAD_DIR, name)
+        try:
+            if path not in active and os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path)
+        except OSError:
+            pass
+
+
+def run_cleanup_loop():
+    while True:
+        time.sleep(3600)
+        cleanup_expired_sessions()
+
+
+def run_job(job_id, fn, session=None):
     def log(msg):
         with jobs_lock:
             jobs[job_id]["log"].append(str(msg))
 
     def worker():
-        with work_lock:
-            with jobs_lock:
-                jobs[job_id]["state"] = "running"
-            try:
+        try:
+            with work_lock:
+                with jobs_lock:
+                    jobs[job_id]["state"] = "running"
                 result = fn(log)
                 with jobs_lock:
                     jobs[job_id].update(state="done", result=result)
-            except Exception as e:
-                traceback.print_exc()
-                with jobs_lock:
-                    jobs[job_id].update(state="error", error=str(e))
+        except Exception as e:
+            traceback.print_exc()
+            with jobs_lock:
+                jobs[job_id].update(state="error", error=str(e))
+        finally:
+            if session:
+                with active_sessions_lock:
+                    active_sessions.discard(session)
 
     with jobs_lock:
         jobs[job_id] = {"state": "queued", "log": []}
+    if session:
+        with active_sessions_lock:
+            active_sessions.add(session)
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -127,13 +179,34 @@ class Handler(BaseHTTPRequestHandler):
     def _err(self, code, msg):
         self._json({"error": msg}, code)
 
-    def _local_request_ok(self):
-        """Block DNS-rebinding and cross-site requests from other web pages."""
-        if self.headers.get("Host", "") not in ALLOWED_HOSTS:
+    def _request_ok(self):
+        """Restrict host/origin and require credentials when configured."""
+        if self.headers.get("Host", "").lower() not in ALLOWED_HOSTS:
+            self._err(403, "forbidden")
             return False
         origin = self.headers.get("Origin")
-        if origin is not None and urlparse(origin).netloc not in ALLOWED_HOSTS:
+        if origin is not None and urlparse(origin).netloc.lower() not in ALLOWED_HOSTS:
+            self._err(403, "forbidden")
             return False
+        if _AUTH_PASSWORD:
+            scheme, _, token = self.headers.get("Authorization", "").partition(" ")
+            try:
+                supplied = (base64.b64decode(token, validate=True).decode("utf-8")
+                            if scheme.lower() == "basic" else "")
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                supplied = ""
+            username, separator, password = supplied.partition(":")
+            user_ok = hmac.compare_digest(username.encode(), _AUTH_USERNAME.encode())
+            password_ok = hmac.compare_digest(password.encode(), _AUTH_PASSWORD.encode())
+            if not separator or not (user_ok and password_ok):
+                body = b'{"error":"authentication required"}'
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="Caption Studio", charset="UTF-8"')
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return False
         return True
 
     def _read_json(self):
@@ -184,8 +257,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- routes ----------
     def do_GET(self):
-        if not self._local_request_ok():
-            return self._err(403, "forbidden")
+        if self.path == "/healthz":
+            return self._json({"status": "ok"})
+        if not self._request_ok():
+            return
         u = urlparse(self.path)
         q = parse_qs(u.query)
         sid = (q.get("id") or [""])[0]
@@ -293,8 +368,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(404, "not found")
 
     def do_POST(self):
-        if not self._local_request_ok():
-            return self._err(403, "forbidden")
+        if not self._request_ok():
+          return
         u = urlparse(self.path)
 
         if u.path == "/api/upload":
@@ -527,7 +602,7 @@ class Handler(BaseHTTPRequestHandler):
                 return {"download": f"/media/captioned?id={os.path.basename(sess)}"}
 
             jid = secrets.token_hex(8)
-            run_job(jid, export)
+            run_job(jid, export, sess)
             return self._json({"job": jid})
 
         return self._err(404, "not found")
@@ -574,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"id": sid}
 
         jid = secrets.token_hex(8)
-        run_job(jid, job)
+        run_job(jid, job, sess)
         return self._json({"job": jid, "id": sid})
 
     def log_message(self, fmt, *args):  # keep the terminal quiet except errors
@@ -2612,6 +2687,9 @@ def main():
     import urllib.request
     import webbrowser
     os.makedirs(UPLOAD_DIR, exist_ok=True)
+    cleanup_expired_sessions()
+    if RETENTION_HOURS > 0:
+      threading.Thread(target=run_cleanup_loop, daemon=True).start()
     url = f"http://{HOST}:{PORT}"
     if WINDOWS:
         # Windows console may not be UTF-8: never crash on printing a non-English caption
@@ -2641,7 +2719,10 @@ def main():
               else "(To restart it: pkill -f caption_studio.py, then run this again.)")
         webbrowser.open(url)
         return
-    print(f"Caption Studio running at {url}  (this {'PC' if WINDOWS else 'Mac'} only; Ctrl+C to stop)")
+    if not _LOCAL_BIND:
+      print(f"Caption Studio listening on {HOST}:{PORT}")
+    else:
+      print(f"Caption Studio running at {url}  (this {'PC' if WINDOWS else 'Mac'} only; Ctrl+C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

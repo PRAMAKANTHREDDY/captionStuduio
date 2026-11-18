@@ -368,7 +368,12 @@ FONT_DIRS = [
 ]
 # ---------- Windows: same styles, using the closest font that ships with Windows ----------
 WINDOWS = sys.platform == "win32"
+LINUX = sys.platform.startswith("linux")
 WIN_FONT_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+LINUX_FONT_DIRS = [
+    "/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/noto", "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
+]
 if WINDOWS:
     FONT_DIRS.append(WIN_FONT_DIR)
     if os.environ.get("LOCALAPPDATA"):  # fonts installed "for this user only"
@@ -421,6 +426,55 @@ if WINDOWS:
             _st["alt_font"], _st["alt_css"] = _windows_face(_st["alt_font"], _st["alt_css"])
         if "variants" in _st:
             _st["variants"] = [_windows_face(f, c) + (col,) for f, c, col in _st["variants"]]
+if LINUX:
+    FONT_DIRS.extend(LINUX_FONT_DIRS)
+    _LINUX_FONTS = {
+        ("SFNS.ttf", 0): ["dejavu/DejaVuSans.ttf"],
+        ("Helvetica.ttc", 1): ["liberation/LiberationSans-Bold.ttf", "dejavu/DejaVuSans-Bold.ttf"],
+        ("Arial.ttf", 0): ["liberation/LiberationSans-Regular.ttf", "dejavu/DejaVuSans.ttf"],
+        ("Arial Black.ttf", 0): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Arial Rounded Bold.ttf", 0): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Impact.ttf", 0): ["dejavu/DejaVuSansCondensed-Bold.ttf", "dejavu/DejaVuSans-Bold.ttf"],
+        ("Avenir Next.ttc", 0): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Avenir Next.ttc", 2): ["dejavu/DejaVuSans.ttf"],
+        ("Avenir Next.ttc", 5): ["dejavu/DejaVuSans.ttf"],
+        ("Avenir Next.ttc", 8): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Futura.ttc", 2): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Futura.ttc", 4): ["dejavu/DejaVuSansCondensed-Bold.ttf", "dejavu/DejaVuSans-Bold.ttf"],
+        ("Menlo.ttc", 1): ["dejavu/DejaVuSansMono-Bold.ttf"],
+        ("AmericanTypewriter.ttc", 0): ["dejavu/DejaVuSerif.ttf"],
+        ("Chalkduster.ttf", 0): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("MarkerFelt.ttc", 0): ["dejavu/DejaVuSans.ttf"],
+        ("MarkerFelt.ttc", 1): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Georgia Italic.ttf", 0): ["liberation/LiberationSerif-Italic.ttf", "dejavu/DejaVuSerif-Italic.ttf"],
+        ("Courier New Bold.ttf", 0): ["liberation/LiberationMono-Bold.ttf", "dejavu/DejaVuSansMono-Bold.ttf"],
+        ("Comic Sans MS Bold.ttf", 0): ["dejavu/DejaVuSans-Bold.ttf"],
+        ("Trebuchet MS Bold.ttf", 0): ["liberation/LiberationSans-Bold.ttf", "dejavu/DejaVuSans-Bold.ttf"],
+        ("Bodoni 72.ttc", 0): ["liberation/LiberationSerif-Regular.ttf", "dejavu/DejaVuSerif.ttf"],
+        ("Bodoni 72.ttc", 2): ["liberation/LiberationSerif-Bold.ttf", "dejavu/DejaVuSerif-Bold.ttf"],
+    }
+
+    def _linux_face(face, css):
+        if os.path.exists(face[0]):
+            return face, css
+        names = _LINUX_FONTS.get((os.path.basename(face[0]), face[1]), [])
+        path = next((os.path.join("/usr/share/fonts/truetype", name)
+                     for name in names if os.path.exists(os.path.join("/usr/share/fonts/truetype", name))), None)
+        if path is None:
+            return face, css
+        try:
+            from PIL import ImageFont
+            family = ImageFont.truetype(path, 12).getname()[0]
+        except Exception:
+            return (path, 0), css
+        return (path, 0), dict(css, family=f"'{family}'")
+
+    for _st in STYLES.values():
+        _st["font"], _st["css"] = _linux_face(_st["font"], _st["css"])
+        if "alt_font" in _st:
+            _st["alt_font"], _st["alt_css"] = _linux_face(_st["alt_font"], _st["alt_css"])
+        if "variants" in _st:
+            _st["variants"] = [_linux_face(f, c) + (col,) for f, c, col in _st["variants"]]
 _SKIP_FONTS = ("emoji", "lastresort", "braille", "keyboard", "symbol", "wingding", "webding",
                "dingbat", "bodoni ornaments", "marlett")
 _font_cache = None
@@ -1207,6 +1261,8 @@ def save_keywords(sess, index, text, kw):
 EMOJI_FONT = "/System/Library/Fonts/Apple Color Emoji.ttc"
 if WINDOWS:
     EMOJI_FONT = os.path.join(WIN_FONT_DIR, "seguiemj.ttf")  # Segoe UI Emoji (colour, any size)
+elif LINUX:
+    EMOJI_FONT = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
 EMOJI_MAP = {}
 for _e, _words in {
     "💰": "money cash dollar dollars rich pay paid price cost profit income salary million millions billion",
