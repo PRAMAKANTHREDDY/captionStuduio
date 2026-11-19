@@ -44,35 +44,37 @@ python windows_selftest.py
 
 The self-test checks FFmpeg, dependencies, caption rendering, transcription, and the local web server. Its first run downloads a small test model.
 
-## Deploy an access-controlled preview on Render
+## Deploy a no-login prototype on Render
 
-This is a **paid, single-worker preview**, not a free or production multi-user service. Render's free web service has 512 MB RAM, sleeps when idle, and loses local files on restart; that is unsuitable for the Whisper model and uploaded videos. Check Render's current pricing before enabling a paid service.
+This public prototype does not require user accounts or a password. It processes one heavy job at a time and is intended for short, non-sensitive clips. The `large-v3-turbo` CPU model can be slow, and hosted restarts can lose queued or completed work in memory.
 
 1. Sign in to Render and connect the GitHub account that owns `PRAMAKANTHREDDY/captionStuduio`.
-2. Select **New → Web Service**, choose that repository and the `main` branch, and let Render use the repository's `Dockerfile`.
-3. Choose a **paid** compute plan with several GB of RAM. Start with at least 4 GB and benchmark a short video; CPU transcription may be slow. Set one instance and keep the app's single-job processing model.
-4. Add a persistent disk mounted at `/var/data`. Model files and uploads are stored there. A disk has an additional charge and needs enough space for the downloaded model plus temporary input/output videos.
-5. Add these environment variables in the Render service settings before the first successful deploy:
+2. Select **New → Web Service**, choose the repository and `main` branch, and let Render use the repository's `Dockerfile`.
+3. Choose a paid compute plan with several GB of RAM. Start with at least 4 GB. CPU transcription is slower than GPU transcription.
+4. Add a persistent disk mounted at `/var/data` if you need model and session data to survive restarts. Uploads and exports are still managed by the app's retention setting.
+5. Add these environment variables in the Render service settings:
 
 	| Key | Value |
 	|-----|-------|
-	| `CAPTION_STUDIO_ALLOWED_HOSTS` | The exact Render hostname, e.g. `your-service.onrender.com`; add a custom domain as a comma-separated value if used |
-	| `CAPTION_STUDIO_USERNAME` | A username for the shared preview login |
-	| `CAPTION_STUDIO_PASSWORD` | A long, unique password stored as a secret |
-	| `CAPTION_STUDIO_MAX_UPLOAD_BYTES` | `104857600` (100 MB default) |
-	| `CAPTION_STUDIO_RETENTION_HOURS` | `24` (hosted session folders are automatically deleted after this period) |
+	| `CAPTION_STUDIO_ALLOWED_HOSTS` | The exact Render hostname, e.g. `your-service.onrender.com`; add custom domains if used |
+	| `CAPTION_STUDIO_ALLOW_ANONYMOUS` | `1` |
+	| `CAPTION_STUDIO_MAX_UPLOAD_BYTES` | `104857600` |
+	| `CAPTION_STUDIO_MAX_VIDEO_SECONDS` | `600` |
+	| `CAPTION_STUDIO_MAX_ACTIVE_JOBS` | `1` |
+	| `CAPTION_STUDIO_MAX_JOBS_PER_DAY` | `5` |
+	| `CAPTION_STUDIO_RETENTION_HOURS` | `24` |
 
-	The Docker image sets `CAPTION_STUDIO_HOST=0.0.0.0`, `CAPTION_STUDIO_UPLOAD_DIR=/var/data/uploads`, and `HF_HOME=/var/data/huggingface`. Render supplies `PORT`. Never commit the username or password.
+	The Docker image sets `CAPTION_STUDIO_HOST=0.0.0.0`, `CAPTION_STUDIO_UPLOAD_DIR=/var/data/uploads`, and `HF_HOME=/var/data/huggingface`. Render supplies `PORT`. Do not set username/password variables in anonymous mode.
 
 	In Render's health-check settings, set the path to `/healthz`.
 
-6. Deploy. The first transcription downloads the Whisper model and may take several minutes. Open the Render HTTPS URL, enter the shared login, and test with a short, non-sensitive video.
-7. Check logs and disk use. Confirm transcription, editing, export, and 24-hour cleanup before sharing the URL.
+6. Deploy. The first transcription downloads the Whisper model and may take several minutes. Test with a short, non-sensitive video.
+7. Check logs and disk use. Confirm upload, transcription, editing, export, and cleanup before sharing the URL.
 
-This preview uses one shared Basic Auth login, keeps job state in memory, and processes one heavy job at a time. Do not use it for confidential videos or invite the general public yet. A public launch needs individual user accounts, quotas, a durable job queue, and managed object storage. Those pieces can be added later without changing the transcription model.
+This prototype keeps the same editing UI and export features. It has no individual accounts and uses a shared daily limit. Do not use it for confidential videos. A production launch needs a durable job queue, managed object storage, individual quotas, and abuse protection.
 
 ## Privacy and network access
 
-Without hosted configuration, the server binds to `127.0.0.1` and can only be opened on the same computer. Binding to a public interface requires an allowlisted hostname and both username and password; the app refuses to start if these are missing. Hosted mode should only be used behind the platform's HTTPS proxy. This repository does not include user recordings, model caches, or local environment files.
+Without hosted configuration, the server binds to `127.0.0.1` and can only be opened on the same computer. For anonymous public mode, set `CAPTION_STUDIO_ALLOW_ANONYMOUS=1` and allowlist the public hostname. Hosted mode should only be used behind the platform's HTTPS proxy. This repository does not include user recordings, model caches, or local environment files.
 
 For current platform constraints, see [Render free services](https://render.com/docs/free), [Render web services](https://render.com/docs/web-services), and [persistent disks](https://render.com/docs/disks).
