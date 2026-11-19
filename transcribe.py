@@ -2339,21 +2339,21 @@ def burn_captions(video, captions, out, size_frac=1 / 16, y_frac=0.62, opacity=0
 def audio_offset(video):
     """Seconds the audio track starts after the video track (Android screen recordings often
     start audio ~0.25 s late). Speech times are measured from the audio's start."""
-    def start(sel):
-        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", sel, "-show_entries",
-                              "stream=start_time", "-of", "csv=p=0", video],
-                             capture_output=True, text=True).stdout.split()
-        try:
-            return float(out[0])
-        except (IndexError, ValueError):
-            return 0.0
-    return max(0.0, start("a:0") - start("v:0"))
+    import av
+    with av.open(video) as container:
+        def stream_start(stream):
+            if stream is None or stream.start_time is None or stream.time_base is None:
+                return 0.0
+            return float(stream.start_time * stream.time_base)
+        video_stream = next((s for s in container.streams if s.type == "video"), None)
+        audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+        return max(0.0, stream_start(audio_stream) - stream_start(video_stream))
 
 
 def has_audio(video):
-    streams = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
-                              "-of", "csv=p=0", video], capture_output=True, text=True).stdout
-    return "audio" in streams
+    import av
+    with av.open(video) as container:
+        return any(stream.type == "audio" for stream in container.streams)
 
 
 _models = {}
@@ -2386,9 +2386,18 @@ def transcribe_session(sess, video, model_name=None, log=print, language="en", u
         raise ValueError(f"{os.path.basename(video)} has no audio track")
     audio = os.path.join(sess, "audio.wav")
     log("extracting audio ...")
-    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", video, "-vn",
-                    "-ac", "1", "-ar", "16000", audio], check=True,
-                   stdin=subprocess.DEVNULL)
+    import av
+    with av.open(video) as source, av.open(audio, "w") as output:
+        source_stream = next(stream for stream in source.streams if stream.type == "audio")
+        output_stream = output.add_stream("pcm_s16le", rate=16000)
+        output_stream.layout = "mono"
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        for frame in source.decode(source_stream):
+            for out_frame in resampler.resample(frame):
+                for packet in output_stream.encode(out_frame):
+                    output.mux(packet)
+        for packet in output_stream.encode(None):
+            output.mux(packet)
 
     from faster_whisper import WhisperModel
     log(f"transcribing (model={model_name}; first run downloads the model) ...")
@@ -2400,9 +2409,7 @@ def transcribe_session(sess, video, model_name=None, log=print, language="en", u
         language=language or None,           # None = auto-detect
         task="translate" if translate else "transcribe",
         condition_on_previous_text=False,    # avoids repeated / runaway text
-        vad_filter=True,
-        # pad detected speech so fast, short words ("Button") at the edges aren't cut off
-        vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=400),
+        vad_filter=False,                    # preserve quiet/short speech; do not remove interview sections
     )
     # vocabulary.txt is English, so only use it when the audio is English
     vocab = load_vocab() if use_vocab and language == "en" and not translate else []
@@ -2422,10 +2429,8 @@ def transcribe_session(sess, video, model_name=None, log=print, language="en", u
             words=[dataclasses.replace(w, start=w.start + off, end=w.end + off) for w in (s.words or [])])
             for s in segments]
         log(f"aligned speech to video (audio starts {off:.2f}s after video)")
-    junk = [s for s in segments if is_junk(s)]
-    segments = [s for s in segments if not is_junk(s)]
-    if junk:
-        log(f"dropped {len(junk)} unclear segment(s): " + " | ".join(s.text.strip() for s in junk))
+    # Keep every detected segment, including quiet interview and end speech.
+    # Junk confidence is recorded for review, never used to silently remove text.
 
     words = [dict(start=round(w.start, 3), end=round(w.end, 3), word=w.word.strip(),
                   prob=round(w.probability, 3)) for s in segments for w in (s.words or [])]
@@ -2462,7 +2467,7 @@ def main():
     ap.add_argument("session", nargs="?", help="session folder (default: latest)")
     ap.add_argument("--model", default=DEFAULT_MODEL,
                     help=f"whisper model: tiny, base, small, large-v3-turbo (default: {DEFAULT_MODEL})")
-    ap.add_argument("--language", default="en", help="spoken language code, or 'auto' (default: en)")
+    ap.add_argument("--language", default="auto", help="spoken language code, or 'auto' (default: auto)")
     ap.add_argument("--translate", action="store_true", help="output English captions from any spoken language")
     ap.add_argument("--vocab", action="store_true",
                     help="bias recognition toward words in vocabulary.txt (may hide mispronunciations)")

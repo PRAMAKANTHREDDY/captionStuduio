@@ -25,11 +25,12 @@ import sys
 import re
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import caption_effects as fx
 import transcribe as tr
@@ -48,22 +49,31 @@ LANGUAGES = {  # Whisper language codes offered in the page
 }
 ALLOWED_EXT = {".mov", ".mp4", ".m4v"}
 _LOCAL_BIND = HOST in ("127.0.0.1", "::1", "localhost")
+_ALLOW_ANONYMOUS = os.environ.get("CAPTION_STUDIO_ALLOW_ANONYMOUS") == "1"
 _AUTH_USERNAME = os.environ.get("CAPTION_STUDIO_USERNAME", "")
 _AUTH_PASSWORD = os.environ.get("CAPTION_STUDIO_PASSWORD", "")
 _configured_hosts = os.environ.get("CAPTION_STUDIO_ALLOWED_HOSTS", "")
 ALLOWED_HOSTS = ({f"127.0.0.1:{PORT}", f"localhost:{PORT}"} if _LOCAL_BIND else
          {host.strip().lower() for host in _configured_hosts.split(",") if host.strip()})
-if not _LOCAL_BIND and (not _AUTH_USERNAME or not _AUTH_PASSWORD or not ALLOWED_HOSTS):
-  raise RuntimeError("Public binding requires CAPTION_STUDIO_USERNAME, CAPTION_STUDIO_PASSWORD, "
-             "and CAPTION_STUDIO_ALLOWED_HOSTS")
+if not _LOCAL_BIND and (not ALLOWED_HOSTS or bool(_AUTH_USERNAME) != bool(_AUTH_PASSWORD)
+            or (not _ALLOW_ANONYMOUS and not _AUTH_PASSWORD)):
+  raise RuntimeError("Public binding requires an allowed host and either anonymous mode or "
+             "both authentication credentials")
 MAX_UPLOAD = int(os.environ.get(
   "CAPTION_STUDIO_MAX_UPLOAD_BYTES", str(4 * 1024 ** 3 if _LOCAL_BIND else 100 * 1024 ** 2)))
 if MAX_UPLOAD <= 0:
     raise RuntimeError("CAPTION_STUDIO_MAX_UPLOAD_BYTES must be positive")
+MAX_VIDEO_SECONDS = int(os.environ.get("CAPTION_STUDIO_MAX_VIDEO_SECONDS", "0" if _LOCAL_BIND else "600"))
+MAX_ACTIVE_JOBS = int(os.environ.get("CAPTION_STUDIO_MAX_ACTIVE_JOBS", "0" if _LOCAL_BIND else "1"))
+MAX_JOBS_PER_DAY = int(os.environ.get(
+  "CAPTION_STUDIO_MAX_JOBS_PER_DAY", "5" if _ALLOW_ANONYMOUS else "0"))
+if not _LOCAL_BIND and (MAX_VIDEO_SECONDS <= 0 or MAX_ACTIVE_JOBS <= 0
+            or (_ALLOW_ANONYMOUS and MAX_JOBS_PER_DAY <= 0)):
+  raise RuntimeError("Public mode requires positive video-duration and job limits")
 RETENTION_HOURS = float(os.environ.get("CAPTION_STUDIO_RETENTION_HOURS", "0" if _LOCAL_BIND else "24"))
 if RETENTION_HOURS < 0:
     raise RuntimeError("CAPTION_STUDIO_RETENTION_HOURS cannot be negative")
-ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[0-9a-f]{8}$")
+ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[0-9a-f]{8}(?:[0-9a-f]{24})?$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 jobs = {}  # job id -> {"state": queued|running|done|error, "log": [...], ...}
@@ -72,6 +82,22 @@ work_lock = threading.Lock()
 kw_lock = threading.Lock()  # one transcription/export at a time (CPU heavy)
 active_sessions = set()
 active_sessions_lock = threading.Lock()
+
+
+def _job_capacity_error_locked():
+    if MAX_ACTIVE_JOBS and sum(job["state"] in ("queued", "running") for job in jobs.values()) >= MAX_ACTIVE_JOBS:
+        return "The processor is busy; please try again later"
+    if MAX_JOBS_PER_DAY:
+        today = dt.date.today().isoformat()
+        started = sum(job.get("created") == today for job in jobs.values())
+        if started >= MAX_JOBS_PER_DAY:
+            return "The daily processing limit has been reached; please try again tomorrow"
+    return None
+
+
+def job_capacity_error():
+    with jobs_lock:
+        return _job_capacity_error_locked()
 
 
 def session_path(sid):
@@ -135,11 +161,14 @@ def run_job(job_id, fn, session=None):
                     active_sessions.discard(session)
 
     with jobs_lock:
-        jobs[job_id] = {"state": "queued", "log": []}
+        if _job_capacity_error_locked():
+            return False
+        jobs[job_id] = {"state": "queued", "log": [], "created": dt.date.today().isoformat()}
     if session:
         with active_sessions_lock:
             active_sessions.add(session)
     threading.Thread(target=worker, daemon=True).start()
+    return True
 
 
 _font_bytes = {}
@@ -369,7 +398,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._request_ok():
-          return
+            return
         u = urlparse(self.path)
 
         if u.path == "/api/upload":
@@ -608,7 +637,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(404, "not found")
 
     def _upload(self):
-        name = os.path.basename(self.headers.get("X-Filename", "video.mov"))
+        capacity_error = job_capacity_error()
+        if capacity_error:
+            return self._err(429, capacity_error)
+        name = os.path.basename(unquote(self.headers.get("X-Filename", "video.mov")))
         use_vocab = self.headers.get("X-Use-Vocab") == "1"
         language = self.headers.get("X-Language", "en")
         if language == "auto":
@@ -624,32 +656,48 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._err(400, "bad length")
         if length <= 0 or length > MAX_UPLOAD:
-            return self._err(400, "file is empty or larger than 4 GB")
+            return self._err(400, f"file is empty or larger than {MAX_UPLOAD // 1024 // 1024} MB")
 
-        sid = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(4)
+        sid = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(16)
         sess = os.path.join(UPLOAD_DIR, sid)
         os.makedirs(sess)
         video = os.path.join(sess, "video" + ext)
-        with open(video, "wb") as f:
+        with open(video, "wb") as handle:
             left = length
             while left > 0:
                 chunk = self.rfile.read(min(1024 * 1024, left))
                 if not chunk:
                     break
-                f.write(chunk)
+                handle.write(chunk)
                 left -= len(chunk)
         if left:
+            shutil.rmtree(sess, ignore_errors=True)
             return self._err(400, "upload interrupted")
-        with open(os.path.join(sess, "original_name.txt"), "w", encoding="utf-8") as f:
-            f.write(name)
+        if MAX_VIDEO_SECONDS:
+            try:
+                result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                     "default=noprint_wrappers=1:nokey=1", video], capture_output=True, text=True,
+                    check=True, timeout=30)
+                duration = float(result.stdout.strip())
+            except (OSError, subprocess.SubprocessError, ValueError):
+                shutil.rmtree(sess, ignore_errors=True)
+                return self._err(400, "could not read video duration")
+            if not 0 < duration <= MAX_VIDEO_SECONDS:
+                shutil.rmtree(sess, ignore_errors=True)
+                return self._err(413, f"video must be no longer than {MAX_VIDEO_SECONDS // 60} minutes")
+        with open(os.path.join(sess, "original_name.txt"), "w", encoding="utf-8") as handle:
+            handle.write(name)
 
         def job(log):
             tr.transcribe_session(sess, video, None, log, language=language, use_vocab=use_vocab,
-                                  translate=translate)
+                                 translate=translate)
             return {"id": sid}
 
         jid = secrets.token_hex(8)
-        run_job(jid, job, sess)
+        if not run_job(jid, job, sess):
+            shutil.rmtree(sess, ignore_errors=True)
+            return self._err(429, job_capacity_error() or "processor busy")
         return self._json({"job": jid, "id": sid})
 
     def log_message(self, fmt, *args):  # keep the terminal quiet except errors
@@ -1279,7 +1327,7 @@ function upload(f) {
   st.textContent = 'Uploading ' + f.name + ' ...';
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/upload');
-  xhr.setRequestHeader('X-Filename', f.name);
+  xhr.setRequestHeader('X-Filename', encodeURIComponent(f.name));
   xhr.setRequestHeader('X-Use-Vocab', $('useVocab').checked ? '1' : '0');
   xhr.setRequestHeader('X-Language', $('lang').value);
   xhr.setRequestHeader('X-Translate', $('translate').checked ? '1' : '0');

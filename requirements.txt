@@ -1,4 +1,5 @@
 faster-whisper
+av>=11,<19
 Pillow
 fonttools
 numpy
