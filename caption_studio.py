@@ -707,7 +707,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 PAGE = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Caption Studio</title>
+<html><head><meta charset="utf-8"><title>Caption Studio | AI Video Captions</title><meta name="description" content="Transcribe videos with Groq, edit captions, customize subtitle styles, and export captioned videos.">
 <style>
   :root {
     color-scheme: dark;
