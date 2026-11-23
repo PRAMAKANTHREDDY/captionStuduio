@@ -1,0 +1,17 @@
+# Words that appear in the app. Only used when you turn on "vocabulary"
+# (transcribe.py --vocab, or the checkbox in Caption Studio).
+# It helps with fast/garbled speech, but can hide real mispronunciation bugs
+# (e.g. it may write "2m" when VoiceOver actually said "2 meters").
+Alexa
+Fire TV
+Discover with Alexa
+Discover more
+IMDb
+Detail Card
+VoiceOver
+TalkBack
+Button
+Double tap to activate
+TV Series
+Season
+Recent chats

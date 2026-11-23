@@ -54,7 +54,51 @@ def srt_time(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def caption_chunks(segments, max_words=7, max_secs=3.5):
+def _caption_text(words, language=None):
+    """Join timestamp tokens into readable text across space and non-space scripts."""
+    no_word_spaces = {"zh", "ja", "th", "lo", "km", "my"}
+    lang = (language or "").lower().split("-")[0]
+    closing_punctuation = ".,! ?;:%)]}".replace(" ", "") + "\u0964\u0965\u060c\u061b\u061f\u3002\uff01\uff1f\u3001\u300d\u300f\u3011\u300b\u3009\uff09\u201d\u2019"
+    text = ""
+    for word in words:
+        token = word.word
+        if not text:
+            text = token.lstrip()
+        elif token[:1].isspace() or lang in no_word_spaces:
+            text += token
+        elif token[:1] in closing_punctuation:
+            text += token
+        elif text[-1:] in "([{\u2018\u201c":
+            text += token
+        else:
+            text += " " + token
+    return text.strip()
+
+
+def _reconcile_segment_words(segment, language=None):
+    """Keep full segment text even when the API word timestamp list is incomplete."""
+    from types import SimpleNamespace
+    no_word_spaces = {"zh", "ja", "th", "lo", "km", "my"}
+    lang = (language or "").lower().split("-")[0]
+    if lang in no_word_spaces:
+        return
+    text_words = (segment.text or "").split()
+    if not text_words:
+        return
+    timed_words = segment.words or []
+    if len(text_words) == len(timed_words):
+        for timed, text in zip(timed_words, text_words):
+            timed.word = text
+        return
+    duration = max(0.0, segment.end - segment.start)
+    count = len(text_words)
+    segment.words = [SimpleNamespace(
+        start=segment.start + duration * i / count,
+        end=segment.start + duration * (i + 1) / count,
+        word=text, probability=1.0) for i, text in enumerate(text_words)]
+
+
+def caption_chunks(segments, max_words=7, max_secs=3.5, language=None):
     """Split speech into short captions using word timestamps."""
     chunks = []
     for seg in segments:
@@ -69,7 +113,7 @@ def caption_chunks(segments, max_words=7, max_secs=3.5):
                 cur = []
         if cur:
             chunks.append(cur)
-    return [(c[0].start, c[-1].end, "".join(w.word for w in c).strip()) for c in chunks]
+    return [(c[0].start, c[-1].end, _caption_text(c, language)) for c in chunks]
 
 
 def write_srt(captions, path):
@@ -2356,6 +2400,25 @@ def has_audio(video):
         return any(stream.type == "audio" for stream in container.streams)
 
 
+def _convert_audio(source_path, output_path, rate=16000, layout="mono"):
+    """Extract/resample the first audio track to PCM WAV."""
+    import av
+    with av.open(source_path) as source:
+        stream = next((s for s in source.streams if s.type == "audio"), None)
+        if stream is None:
+            raise ValueError(f"{os.path.basename(source_path)} has no audio track")
+        with av.open(output_path, "w") as output:
+            output_stream = output.add_stream("pcm_s16le", rate=rate)
+            output_stream.layout = layout
+            resampler = av.AudioResampler(format="s16", layout=layout, rate=rate)
+            for frame in source.decode(stream):
+                for converted in resampler.resample(frame):
+                    for packet in output_stream.encode(converted):
+                        output.mux(packet)
+            for packet in output_stream.encode(None):
+                output.mux(packet)
+
+
 _models = {}
 
 DEFAULT_MODEL = "large-v3-turbo"  # most accurate practical model; use --model base for speed
@@ -2377,7 +2440,7 @@ def is_junk(seg):
 
 
 def transcribe_session(sess, video, model_name=None, log=print, language="en", use_vocab=False,
-                       translate=False):
+                       translate=False, separate_vocals=False):
     """Extract audio, transcribe, write transcript.txt + subtitles.srt + words.json.
     language: spoken language code (None = auto-detect). translate=True makes the captions English.
     Returns captions [(start, end, text)]."""
@@ -2385,49 +2448,124 @@ def transcribe_session(sess, video, model_name=None, log=print, language="en", u
     if not has_audio(video):
         raise ValueError(f"{os.path.basename(video)} has no audio track")
     audio = os.path.join(sess, "audio.wav")
-    log("extracting audio ...")
-    import av
-    with av.open(video) as source, av.open(audio, "w") as output:
-        source_stream = next(stream for stream in source.streams if stream.type == "audio")
-        output_stream = output.add_stream("pcm_s16le", rate=16000)
-        output_stream.layout = "mono"
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-        for frame in source.decode(source_stream):
-            for out_frame in resampler.resample(frame):
-                for packet in output_stream.encode(out_frame):
-                    output.mux(packet)
-        for packet in output_stream.encode(None):
-            output.mux(packet)
+    if separate_vocals:
+        import tempfile
+        try:
+            import torch
+            import demucs  # noqa: F401 - verifies the optional runtime is installed
+        except ImportError as exc:
+            raise RuntimeError("Song mode needs Demucs. Install the updated project requirements first.") from exc
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        log(f"extracting stereo audio for vocal separation ({device}) ...")
+        with tempfile.TemporaryDirectory(prefix="demucs_", dir=sess) as work:
+            source_audio = os.path.join(work, "source.wav")
+            output_dir = os.path.join(work, "separated")
+            _convert_audio(video, source_audio, rate=44100, layout="stereo")
+            log("separating vocals from music; first run downloads the model ...")
+            result = subprocess.run(
+                [sys.executable, "-m", "demucs.separate", "-n", "htdemucs",
+                 "--two-stems=vocals", "-d", device, "-o", output_dir, source_audio],
+                capture_output=True, text=True)
+            if result.returncode:
+                detail = (result.stdout + "\n" + result.stderr).strip().splitlines()
+                raise RuntimeError("Vocal separation failed: " + "\n".join(detail[-12:]))
+            vocals = os.path.join(output_dir, "htdemucs", "source", "vocals.wav")
+            if not os.path.isfile(vocals):
+                raise RuntimeError("Vocal separation finished but did not produce a vocals track.")
+            _convert_audio(vocals, audio, rate=16000, layout="mono")
+        log("vocal track ready; sending it to Groq ...")
+    else:
+        log("extracting audio ...")
+        _convert_audio(video, audio)
 
-    from faster_whisper import WhisperModel
-    log(f"transcribing (model={model_name}; first run downloads the model) ...")
-    if model_name not in _models:
-        _models[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
-    opts = dict(
-        word_timestamps=True,
-        beam_size=5,
-        language=language or None,           # None = auto-detect
-        task="translate" if translate else "transcribe",
-        condition_on_previous_text=False,    # avoids repeated / runaway text
-        vad_filter=False,                    # preserve quiet/short speech; do not remove interview sections
-    )
-    # vocabulary.txt is English, so only use it when the audio is English
+    # Keep a stable segment/word interface for caption generation and export.
     vocab = load_vocab() if use_vocab and language == "en" and not translate else []
     if vocab:
-        # NOTE: biases output toward expected app text, which can hide real
-        # mispronunciation bugs (e.g. "2 meters" -> "2m"). Off by default.
         log(f"using {len(vocab)} vocabulary words from vocabulary.txt")
-        opts["hotwords"] = " ".join(vocab)
-    segments, info = _models[model_name].transcribe(audio, **opts)
-    segments = list(segments)
+    segments = info = None
+    api_key = os.environ.get("GROQ_API_KEY")
+    if api_key:
+        try:
+            from groq import Groq
+            from types import SimpleNamespace
+
+            def response_field(value, name, default=None):
+                return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+            groq_model = "whisper-large-v3" if translate else os.environ.get(
+                "GROQ_WHISPER_MODEL", "whisper-large-v3")
+            log(f"transcribing with Groq (model={groq_model}) ...")
+            client = Groq(api_key=api_key)
+            with open(audio, "rb") as audio_file:
+                request = dict(file=(os.path.basename(audio), audio_file), model=groq_model,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                    prompt=" ".join(vocab)[:900] if vocab else None)
+                if translate:
+                    result = client.audio.translations.create(**request)
+                else:
+                    result = client.audio.transcriptions.create(language=language or None, **request)
+            segments = [SimpleNamespace(start=float(response_field(seg, "start", 0)),
+                end=float(response_field(seg, "end", 0)), text=response_field(seg, "text", ""),
+                avg_logprob=float(response_field(seg, "avg_logprob", 0.0)),
+                no_speech_prob=float(response_field(seg, "no_speech_prob", 0.0)),
+                compression_ratio=float(response_field(seg, "compression_ratio", 0.0)), words=[])
+                for seg in (response_field(result, "segments", None) or [])]
+            for word in (response_field(result, "words", None) or []):
+                item = SimpleNamespace(start=float(response_field(word, "start", 0)),
+                    end=float(response_field(word, "end", 0)),
+                    word=response_field(word, "word", ""), probability=1.0)
+                if segments:
+                    def overlap(seg):
+                        return max(0.0, min(seg.end, item.end) - max(seg.start, item.start))
+                    owner = max(segments, key=overlap)
+                    if overlap(owner) <= 0:
+                        owner = min(segments, key=lambda seg: min(abs(item.start - seg.end),
+                                                                  abs(item.end - seg.start)))
+                    owner.words.append(item)
+            info = SimpleNamespace(language=response_field(result, "language", None) or language or "unknown")
+            for seg in segments:
+                _reconcile_segment_words(seg, info.language)
+            result_text = response_field(result, "text", "")
+            if not segments and result_text.strip():
+                segments = [SimpleNamespace(start=0.0, end=0.0, text=result_text,
+                    avg_logprob=0.0, no_speech_prob=0.0, compression_ratio=0.0, words=[])]
+        except Exception as exc:
+            log(f"Groq unavailable ({exc}); switching to local Whisper")
+            segments = None
+    else:
+        log("GROQ_API_KEY is not set; using local Whisper")
+
+    if segments is None:
+        from faster_whisper import WhisperModel
+        log(f"transcribing locally (model={model_name}; first run downloads the model) ...")
+        if model_name not in _models:
+            _models[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
+        opts = dict(word_timestamps=True, beam_size=5, language=language or None,
+                    task="translate" if translate else "transcribe",
+                    condition_on_previous_text=False, vad_filter=False)
+        if vocab:
+            opts["hotwords"] = " ".join(vocab)
+        segments, info = _models[model_name].transcribe(audio, **opts)
+        segments = list(segments)
     log(f"detected language: {info.language}" + (" (translating to English)" if translate else ""))
     off = audio_offset(video)
     if off > 0.001:  # put speech times on the video's timeline
         import dataclasses
-        segments = [dataclasses.replace(
-            s, start=s.start + off, end=s.end + off,
-            words=[dataclasses.replace(w, start=w.start + off, end=w.end + off) for w in (s.words or [])])
-            for s in segments]
+        aligned = []
+        for s in segments:
+            if dataclasses.is_dataclass(s):
+                aligned.append(dataclasses.replace(s, start=s.start + off, end=s.end + off,
+                    words=[dataclasses.replace(w, start=w.start + off, end=w.end + off)
+                           for w in (s.words or [])]))
+            else:
+                s.start += off
+                s.end += off
+                for w in (s.words or []):
+                    w.start += off
+                    w.end += off
+                aligned.append(s)
+        segments = aligned
         log(f"aligned speech to video (audio starts {off:.2f}s after video)")
     # Keep every detected segment, including quiet interview and end speech.
     # Junk confidence is recorded for review, never used to silently remove text.
@@ -2446,7 +2584,7 @@ def transcribe_session(sess, video, model_name=None, log=print, language="en", u
     if low:
         log("check these words (low confidence): " + ", ".join(low))
 
-    captions = caption_chunks(segments)
+    captions = caption_chunks(segments, language=info.language)
     write_srt(captions, os.path.join(sess, "subtitles.srt"))
     return captions
 

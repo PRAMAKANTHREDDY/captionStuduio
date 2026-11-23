@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Caption Studio Prototype</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0d14; --panel:#171a25; --line:#292d3d; --text:#f3f5ff; --muted:#a7acc1; --accent:#22d3ee; --green:#34d399; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; font-family:Georgia,serif; background:radial-gradient(circle at 15% 0,#26364a 0,transparent 30%),var(--bg); color:var(--text); }
+    main { width:min(760px,calc(100% - 32px)); margin:64px auto; }
+    h1 { margin:0 0 8px; font-size:clamp(36px,8vw,72px); line-height:.95; letter-spacing:0; }
+    .lede { color:var(--muted); font-size:18px; margin:0 0 32px; }
+    .panel { background:rgba(23,26,37,.92); border:1px solid var(--line); border-radius:8px; padding:24px; }
+    input[type=file] { width:100%; border:1px dashed #4c5269; border-radius:6px; padding:18px; background:#11141d; color:var(--text); }
+    button { margin-top:16px; width:100%; height:48px; border:0; border-radius:6px; background:var(--accent); color:#081116; font-weight:800; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:wait; }
+    #status { min-height:24px; margin-top:18px; color:var(--muted); }
+    #captions { margin:18px 0 0; padding:0; list-style:none; max-height:360px; overflow:auto; }
+    #captions li { border-top:1px solid var(--line); padding:10px 0; }
+    #captions time { color:var(--green); font:12px monospace; margin-right:12px; }
+    #download { display:none; margin-top:16px; width:100%; text-decoration:none; text-align:center; line-height:48px; border-radius:6px; background:#34d399; color:#07130f; font-weight:800; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Caption Studio</h1>
+    <p class="lede">No login. CPU prototype. Maximum 10 minutes and 100 MB.</p>
+    <section class="panel">
+      <input id="file" type="file" accept="video/mp4,video/quicktime,.m4v">
+      <button id="upload">Generate captions</button>
+      <div id="status">Choose a short video to begin.</div>
+      <ul id="captions"></ul>
+      <a id="download">Download SRT</a>
+    </section>
+  </main>
+  <script>
+    const API = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+      ? ''
+      : window.CAPTION_API || '';
+
+    const file = document.querySelector('#file');
+    const upload = document.querySelector('#upload');
+    const status = document.querySelector('#status');
+    const captions = document.querySelector('#captions');
+    const download = document.querySelector('#download');
+
+    upload.addEventListener('click', async () => {
+      if (!file.files.length) return;
+      upload.disabled = true;
+      captions.replaceChildren();
+      download.style.display = 'none';
+      status.textContent = 'Uploading…';
+
+      try {
+        const body = new FormData();
+        body.append('file', file.files[0]);
+        const created = await fetch(API + '/api/jobs', { method:'POST', body });
+        const result = await created.json();
+        if (!created.ok) throw new Error(result.error || 'Upload failed');
+
+        while (true) {
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          const response = await fetch(API + '/api/jobs/' + result.id);
+          const job = await response.json();
+          if (!response.ok) throw new Error(job.error || 'Status check failed');
+          status.textContent = job.message || job.state;
+          if (job.state === 'error') throw new Error(job.message);
+          if (job.state === 'done') {
+            job.segments.forEach(segment => {
+              const li = document.createElement('li');
+              const time = document.createElement('time');
+              time.textContent = segment.start.toFixed(2) + 's';
+              li.append(time, document.createTextNode(segment.text));
+              captions.append(li);
+            });
+            download.href = API + '/api/jobs/' + result.id + '/download';
+            download.style.display = 'block';
+            break;
+          }
+        }
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        upload.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

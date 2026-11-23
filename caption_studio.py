@@ -642,6 +642,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(429, capacity_error)
         name = os.path.basename(unquote(self.headers.get("X-Filename", "video.mov")))
         use_vocab = self.headers.get("X-Use-Vocab") == "1"
+        separate_vocals = self.headers.get("X-Separate-Vocals") == "1"
         language = self.headers.get("X-Language", "en")
         if language == "auto":
             language = None
@@ -691,7 +692,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def job(log):
             tr.transcribe_session(sess, video, None, log, language=language, use_vocab=use_vocab,
-                                 translate=translate)
+                                 translate=translate, separate_vocals=separate_vocals)
             return {"id": sid}
 
         jid = secrets.token_hex(8)
@@ -1083,7 +1084,7 @@ PAGE = r"""<!doctype html>
 <div id="uploadView">
   <div class="hero">
     <h1>Turn speech into <em>stunning captions</em></h1>
-    <p>Upload a video. It's transcribed locally, then you style, position and export.</p>
+    <p>Upload a video, choose a language and optional song mode, then style and export.</p>
   </div>
   <div class="card upcard">
     <div id="drop">
@@ -1103,6 +1104,11 @@ PAGE = r"""<!doctype html>
         <option value="auto">Auto-detect</option>@@LANG_OPTIONS@@
       </select>
     </div>
+    <label class="opt" for="separateVocals">
+      <span class="switch"><input id="separateVocals" type="checkbox"><span></span></span>
+      <span style="flex:1;color:var(--text);font-size:13px">Song mode: separate vocals
+        <small>For music videos; slower CPU processing before Groq transcription</small></span>
+    </label>
     <label class="opt" for="translate">
       <span class="switch"><input id="translate" type="checkbox"><span></span></span>
       <span style="flex:1;color:var(--text);font-size:13px">Translate captions to English
@@ -1117,10 +1123,10 @@ PAGE = r"""<!doctype html>
     <div id="upStatus"></div>
   </div>
   <div class="features">
-    <div class="feat"><div class="ic">🎙️</div><b>Accurate speech-to-text</b><span>large-v3-turbo, word timings</span></div>
+    <div class="feat"><div class="ic">🎙️</div><b>Groq speech-to-text</b><span>Whisper Large v3 with word timings</span></div>
     <div class="feat"><div class="ic">✨</div><b>25 caption styles</b><span>incl. Premium YouTube &amp; meme looks</span></div>
     <div class="feat"><div class="ic">🔤</div><b>Any font</b><span>every font on this Mac, incl. Office</span></div>
-    <div class="feat"><div class="ic">🔒</div><b>Private</b><span>nothing leaves your computer</span></div>
+    <div class="feat"><div class="ic">🔒</div><b>Audio processing</b><span>Groq receives audio; song mode separates vocals on the server</span></div>
   </div>
 </div>
 
@@ -1330,6 +1336,7 @@ function upload(f) {
   xhr.setRequestHeader('X-Filename', encodeURIComponent(f.name));
   xhr.setRequestHeader('X-Use-Vocab', $('useVocab').checked ? '1' : '0');
   xhr.setRequestHeader('X-Language', $('lang').value);
+  xhr.setRequestHeader('X-Separate-Vocals', $('separateVocals').checked ? '1' : '0');
   xhr.setRequestHeader('X-Translate', $('translate').checked ? '1' : '0');
   xhr.upload.onprogress = e => { if (e.lengthComputable) st.textContent = `Uploading ${f.name} ... ${Math.round(100 * e.loaded / e.total)}%`; };
   xhr.onload = async () => {

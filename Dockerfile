@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     CAPTION_STUDIO_HOST=0.0.0.0 \
     CAPTION_STUDIO_UPLOAD_DIR=/var/data/uploads \
-    HF_HOME=/var/data/huggingface
+    HF_HOME=/var/data/huggingface \
+    TORCH_HOME=/var/data/torch
 
 WORKDIR /app
 
@@ -17,9 +18,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN python -m pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchaudio \
+    && python -m pip install --no-cache-dir -r requirements.txt
 
 COPY . ./
 
-EXPOSE 10000
+EXPOSE 7860
 CMD ["python", "caption_studio.py"]
